@@ -3,8 +3,10 @@ from basics import SuperBlock,Node,User
 from toolkit import *
 import threading
 import asyncio
+import functools
 
 async def maintain_server():
+    tasks=[]
     async def handle_echo(reader,writer):
         data = await reader.read(100)
         heart_jump=data.decode()
@@ -13,14 +15,33 @@ async def maintain_server():
         print(f"Send: {heart_jump!r}")
         writer.write(data)
         await writer.drain()
-        pass
-    
-    server = await asyncio.start_server(handle_echo, '127.0.0.1', 8888)
-    addr = server.sockets[0].getsockname()
-    print(f'Serving on {addr}')
 
-    async with server:
-        await server.serve_forever()
+    task_1=asyncio.create_task(asyncio.start_server(handle_echo,'127.0.0.1',8888))
+    tasks.append(task_1)
+    
+    async def schedule():
+        async def interval_send(time):
+            await asyncio.sleep(time)
+        def send_heart_jump(future,reader,writer,message):
+            print('send:',message)
+            writer.write(message.encode())
+        while True:
+            try:
+                reader,writer =await asyncio.open_connection('127.0.0.1',9120)
+            except Exception:
+                continue
+            message='NameNode is still alive~'
+            future=asyncio.ensure_future(interval_send(5))
+            await future
+            future.add_done_callback(functools.partial(send_heart_jump,reader=reader,writer=writer,message=message))
+            await writer.drain()
+            data = await reader.read(100)
+            print('Received:',data)
+    
+    task_2=asyncio.create_task(schedule())
+    tasks.append(task_2)
+
+    await asyncio.gather(*tasks)
 
 class FileSystem(object):
     def __init__(self):
@@ -35,6 +56,10 @@ class FileSystem(object):
 
         self.result=""
         self.current_path="root\\"
+        
+        #网络通讯线程
+        self.network_thread=None
+
 
         print('*************************************************************')
         print('******             Welcome to the GreilFS!             ******')
@@ -92,7 +117,8 @@ class FileSystem(object):
     
     def start(self):
         #异步网络通信保持一致性
-        threading.Thread(target=self.keep_network_open,args=(asyncio.get_event_loop(),)).start()
+        self.network_thread=threading.Thread(target=self.keep_network_open,args=(asyncio.get_event_loop(),))
+        self.network_thread.start()
         #同步接收用户输入
         self.recv_input()
 

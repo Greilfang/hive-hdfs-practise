@@ -7,10 +7,8 @@ import functools
 
 
 async def maintain_client():
-    # 用于切分大文件的函数
-    async def split_file():
-        pass
-    # 用于传递心跳包的函数
+    tasks=[]
+    # 用于传递心跳包
     async def echo():
         async def interval_send(time):
             await asyncio.sleep(time)
@@ -18,18 +16,38 @@ async def maintain_client():
             print('send:',message)
             writer.write(message.encode())
         while True:
-            reader,writer =await asyncio.open_connection('127.0.0.1',8888)
-            message='This DataNode is still alive~'
+            try:
+                reader,writer =await asyncio.open_connection('127.0.0.1',8888)
+            except Exception:
+                continue
+            message='DataNode is still alive~'
             future=asyncio.ensure_future(interval_send(5))
             await future
             future.add_done_callback(functools.partial(send_heart_jump,reader=reader,writer=writer,message=message))
             await writer.drain()
             data = await reader.read(100)
             print('Received:',data)
-        
-        #writer.close()
+    task_1=asyncio.create_task(echo())
+    tasks.append(task_1)
+    
+    #用于切分大文件的函数
+    async def handle_schedule(reader,writer):
+        print('handle_schedule')
+        data = await reader.read(100)
+        heart_jump=data.decode()
+        addr = writer.get_extra_info('peername')
+        print(f"Received {heart_jump!r} from {addr!r}")
+        print(f"Send: {heart_jump!r}")
+        writer.write(data)
+        await writer.drain()
+        pass
+    
+    task_2=asyncio.create_task(asyncio.start_server(handle_schedule,'127.0.0.1',9120))
+    tasks.append(task_2)
+    await asyncio.gather(*tasks)
 
-    await echo()
+    #addr = server.sockets[0].getsockname()
+    #print(f'Serving on {addr}')
 
 
 class FileSystem(object):
@@ -45,6 +63,9 @@ class FileSystem(object):
 
         self.result=""
         self.current_path="root\\"
+        
+        # 通讯线程
+        self.network_thread = None
 
         print('*************************************************************')
         print('******             Welcome to the GreilFS!             ******')
@@ -98,8 +119,10 @@ class FileSystem(object):
         netloop.run_forever()
         
     def start(self):
-        threading.Thread(target=self.keep_network_open,args=(asyncio.get_event_loop(),)).start()
-        #asyncio.run(self.keep_network_open)
+        #异步网络接收通讯
+        self.network_thread = threading.Thread(target=self.keep_network_open,args=(asyncio.get_event_loop(),))
+        self.network_thread.start()
+        #同步网络接收输入
         self.recv_input()
 
 

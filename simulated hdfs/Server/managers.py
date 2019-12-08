@@ -4,15 +4,42 @@ from toolkit import *
 import threading
 import asyncio
 import functools
+import queue
 
+Orders = {
+    'mkdir':'mkdir notification',
+    'ls':'ls notification',
+    'vi':'vi notification',
+    'rm':'rm notification'
+}
+
+cluster_config={
+    'NameNode':{
+        'addr':('127.0.0.1',8888),
+        'block_num':0
+        },
+    'DataNode_1':{
+        'addr':('127.0.0.1',9120),
+        'block_num':12000
+        },
+    'DataNode_2':{
+        'addr':('127.0.0.1',10070),
+        'block_num':12000
+        }
+}
+# 发送消息队列
+Send_Queue = queue.Queue(maxsize = 100)
+# 接收消息队列
+Recv_Queue = queue.Queue(maxsize = 100)
 async def maintain_server():
     tasks=[]
     async def handle_echo(reader,writer):
+        #print('handle_echo')
         data = await reader.read(100)
         heart_jump=data.decode()
         addr = writer.get_extra_info('peername')
-        print(f"Received {heart_jump!r} from {addr!r}")
-        print(f"Send: {heart_jump!r}")
+        #print(f"Received {heart_jump!r} from {addr!r}")
+        #print(f"Send: {heart_jump!r}")
         writer.write(data)
         await writer.drain()
 
@@ -26,26 +53,32 @@ async def maintain_server():
             print('send:',message)
             writer.write(message.encode())
         while True:
+            await asyncio.sleep(0.5)
             try:
                 reader,writer =await asyncio.open_connection('127.0.0.1',9120)
             except Exception:
                 continue
-            message='NameNode is still alive~'
-            future=asyncio.ensure_future(interval_send(5))
-            await future
-            future.add_done_callback(functools.partial(send_heart_jump,reader=reader,writer=writer,message=message))
-            await writer.drain()
-            data = await reader.read(100)
-            print('Received:',data)
+            if not Send_Queue.empty():
+                message = Send_Queue.get()
+                writer.write(bytes('{}'.format(message),encoding='utf-8'))
+                await writer.drain()
+                #data=await reader.read(100)
+                #print('Received:',data)
+
     
     task_2=asyncio.create_task(schedule())
     tasks.append(task_2)
 
     await asyncio.gather(*tasks)
 
+
 class FileSystem(object):
     def __init__(self):
-        self.super_block=SuperBlock()
+        total_block_num = 0
+        for k,v in cluster_config.items():
+            total_block_num=total_block_num+v['block_num']
+        print('total_block_num:',total_block_num)
+        self.super_block=SuperBlock(block_num=total_block_num)
         self.file_manager=FileManager(self.super_block)
         self.user_manager=UserManager()
         self.parameter=[None,None]
@@ -57,9 +90,8 @@ class FileSystem(object):
         self.result=""
         self.current_path="root\\"
         
-        #网络通讯线程
-        self.network_thread=None
-
+        # 通讯线程
+        self.network_thread = None
 
         print('*************************************************************')
         print('******             Welcome to the GreilFS!             ******')
@@ -112,14 +144,19 @@ class FileSystem(object):
         asyncio.ensure_future(maintain_server())
         netloop.run_forever()
 
-
+    def toClientBlockIndex(self,block_index):
+        remain_index=block_index
+        for k,v in cluster_config.items():
+            if remain_index >= v['block_num']: 
+                remain_index=remain_index-v['block_num']
+            else:
+                return v['addr'],remain_index
         
-    
     def start(self):
-        #异步网络通信保持一致性
-        self.network_thread=threading.Thread(target=self.keep_network_open,args=(asyncio.get_event_loop(),))
+        #异步网络接收通讯
+        self.network_thread = threading.Thread(target=self.keep_network_open,args=(asyncio.get_event_loop(),))
         self.network_thread.start()
-        #同步接收用户输入
+        #同步网络接收输入
         self.recv_input()
 
 
@@ -153,7 +190,7 @@ class FileSystem(object):
         self.current_path=self.current_path[:-anchor+1]
         print(self.current_path)
 
-
+    
 
     def mkdir(self):
         location_index=self.user_manager.get_current_dir_index()
@@ -210,10 +247,26 @@ class FileSystem(object):
         except IndexError:
             self.result = 'Command error!'
             return
-
-        index=self.file_manager.save(content,sign='txt')
+        
+        filesize = len(content)
+        replic_nodes,replic_blocks=self.file_manager.schedule_save(filesize,sign='txt',replic=3)
         loc_index=self.user_manager.get_current_dir_index()
-        self.file_manager.update_dir_file(loc_index, {file_name: index})
+        self.file_manager.update_dir_file(loc_index, {file_name: replic_nodes})
+
+        for blocks in replic_blocks:
+            for i,block in enumerate(blocks):
+                target_node,client_block = self.toClientBlockIndex(block)
+                print('target_node:',target_node)
+                print('client_block:',client_block)
+                bc=self.file_manager.block_manager.block_size
+                #分割出DataNode要保存的内容
+                command={
+                    'Type':'Save',
+                    'Target':target_node,
+                    'Content':content[bc*i:bc*(i+1)],
+                    'Node':client_block
+                }
+                Send_Queue.put(command)
         self.result="Create successfully"
 
     def more(self):
@@ -287,8 +340,6 @@ class FileSystem(object):
         current_dir_data=self.file_manager.load(location_index=location_index,data_type='dir')
         name_list=self.file_manager.subfile(location_index,current_dir_data['.'])
 
-        #print("name_list",name_list)
-
         try:
             file_name=self.parameter[0]
         except IndexError:
@@ -325,6 +376,15 @@ class FileManager(object):
         # print("Root dir node index is ",root_index)
         # print("File Manager initialized.")
         pass
+
+    def schedule_save(self,filesize,sign,replic=1):
+        replic_node_indexes,replic_block_indexes=[],[]
+        for r in range(replic):
+            block_index=self.block_manager.schedule_save(filesize)
+            replic_block_indexes.append(block_index)
+            node_index=self.node_manager.schedule_save(block_index,filesize,sign)
+            replic_node_indexes.append(node_index)
+        return replic_node_indexes,replic_block_indexes
 
     def save(self,data,sign):
         #print("Data",data)
@@ -398,13 +458,20 @@ class NodeManager():
         # print("Node Manager initialized")
         pass
 
+    def schedule_save(self,block_indexs,filesize,sign):
+        index=self.allocate_nodes()
+        node=self.get_node(index)
+        node.set_file_size(filesize)
+        node.set_block_indexs(block_indexs)
+        node.set_sign(sign)
+        return index
+
     def save(self,block_indexs,size,sign):
         index=self.allocate_nodes()
         node=self.get_node(index)
         node.set_file_size(size)
         node.set_block_indexs(block_indexs)
         node.set_sign(sign)
-
         return index
 
     def allocate_nodes(self):
@@ -445,7 +512,11 @@ class BlockManager():
         self.blocks=[b'']*num
         # print("Block Manager initialized")
         pass
-
+    
+    
+    def schedule_save(self,filesize):
+        indexs=self.allocate_blocks(filesize)
+        return indexs
     def save(self,data):
         # print("type of data ",type(data))
         size=len(data)
@@ -516,3 +587,4 @@ class UserManager(object):
 
     def set_current_dir_index(self,new_index):
         self.user.dir_index=new_index
+

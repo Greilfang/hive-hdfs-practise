@@ -1,6 +1,6 @@
 #超级块，记录文件系统元信息
 class SuperBlock(object):
-    def __init__(self):
+    def __init__(self,block_num=12000):
         self.file_system_name = "GreilOS"
         self.bit = 8
         self.file_system_size = 1024*1024*1024 #1G的文件大小
@@ -8,7 +8,7 @@ class SuperBlock(object):
         self.node_size = 128 # 每一个数据块的大小
         self.node_num = 120 # 最多存储120个文件
         self.data_block_size = 8 * 1024 # 一个数据块1k,对应hdfs的64m
-        self.data_block_num = 12000 #每个DataNode可以支持12000个数据块
+        self.data_block_num = block_num #每个DataNode可以支持12000个数据块
         self.__address_size = 4
 
 class Node(object):

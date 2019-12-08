@@ -4,8 +4,17 @@ from toolkit import *
 import threading
 import asyncio
 import functools
+import queue
 
-
+# 发送消息队列
+Send_Queue=queue.Queue(maxsize=100)
+# 接收消息队列
+Recv_Queue=queue.Queue(maxsize=100)
+cluster_config={
+    'NameNode':('127.0.0.1',8888),
+    'DataNode_1':('127.0.0.1',9120),
+    'DataNode_2':('127.0.0.1',10070)
+}
 async def maintain_client():
     tasks=[]
     # 用于传递心跳包
@@ -21,7 +30,7 @@ async def maintain_client():
             except Exception:
                 continue
             message='DataNode is still alive~'
-            future=asyncio.ensure_future(interval_send(5))
+            future=asyncio.ensure_future(interval_send(10))
             await future
             future.add_done_callback(functools.partial(send_heart_jump,reader=reader,writer=writer,message=message))
             await writer.drain()
@@ -32,14 +41,13 @@ async def maintain_client():
     
     #用于切分大文件的函数
     async def handle_schedule(reader,writer):
-        print('handle_schedule')
+        #print('handle_schedule')
         data = await reader.read(100)
-        heart_jump=data.decode()
+        command=data.decode()
         addr = writer.get_extra_info('peername')
-        print(f"Received {heart_jump!r} from {addr!r}")
-        print(f"Send: {heart_jump!r}")
-        writer.write(data)
-        await writer.drain()
+        #print(f"Received {command!r} from {addr!r}")
+        print('Received:',eval(command))
+        Recv_Queue.put(eval(command))
         pass
     
     task_2=asyncio.create_task(asyncio.start_server(handle_schedule,'127.0.0.1',9120))
@@ -52,7 +60,7 @@ async def maintain_client():
 
 class FileSystem(object):
     def __init__(self):
-        self.super_block=SuperBlock()
+        self.super_block=SuperBlock(block_num=12000)
         self.file_manager=FileManager(self.super_block)
         self.user_manager=UserManager()
         self.parameter=[None,None]
@@ -289,8 +297,6 @@ class FileSystem(object):
         location_index=self.user_manager.get_current_dir_index()
         current_dir_data=self.file_manager.load(location_index=location_index,data_type='dir')
         name_list=self.file_manager.subfile(location_index,current_dir_data['.'])
-
-        #print("name_list",name_list)
 
         try:
             file_name=self.parameter[0]

@@ -7,7 +7,7 @@ class SuperBlock(object):
         self.block_index_size = 4 #块索引的大小
         self.node_size = 128 # 每一个数据块的大小
         self.node_num = 120 # 最多存储120个文件
-        self.data_block_size = 8 * 1024 # 一个数据块1k,对应hdfs的64m
+        self.data_block_size = 8 * 16 # 一个数据块1k,对应hdfs的64m
         self.data_block_num = block_num #每个DataNode可以支持12000个数据块
         self.__address_size = 4
 

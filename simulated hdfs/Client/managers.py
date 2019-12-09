@@ -5,6 +5,7 @@ import threading
 import asyncio
 import functools
 import queue
+import time
 
 # 发送消息队列
 Send_Queue=queue.Queue(maxsize=100)
@@ -15,44 +16,49 @@ cluster_config={
     'DataNode_1':('127.0.0.1',9120),
     'DataNode_2':('127.0.0.1',10070)
 }
-async def maintain_client():
-    tasks=[]
+def maintain_client():
+    loop=asyncio.new_event_loop()
     # 用于传递心跳包
     async def echo():
-        async def interval_send(time):
-            await asyncio.sleep(time)
-        def send_heart_jump(future,reader,writer,message):
-            print('send:',message)
-            writer.write(message.encode())
         while True:
+            await asyncio.sleep(60)
             try:
                 reader,writer =await asyncio.open_connection('127.0.0.1',8888)
             except Exception:
                 continue
-            message='DataNode is still alive~'
-            future=asyncio.ensure_future(interval_send(10))
-            await future
-            future.add_done_callback(functools.partial(send_heart_jump,reader=reader,writer=writer,message=message))
+            message='heart_jump'
+            print('send',message)
+            writer.write(message.encode())
             await writer.drain()
             data = await reader.read(100)
             print('Received:',data)
-    task_1=asyncio.create_task(echo())
-    tasks.append(task_1)
-    
+            writer.close()
+    loop.create_task(echo())
+
     #用于切分大文件的函数
     async def handle_schedule(reader,writer):
-        #print('handle_schedule')
-        data = await reader.read(100)
+        data = await reader.read(1000)
         command=data.decode()
         addr = writer.get_extra_info('peername')
-        #print(f"Received {command!r} from {addr!r}")
         print('Received:',eval(command))
         Recv_Queue.put(eval(command))
-        pass
-    
-    task_2=asyncio.create_task(asyncio.start_server(handle_schedule,'127.0.0.1',9120))
-    tasks.append(task_2)
-    await asyncio.gather(*tasks)
+        pass   
+    loop.create_task(asyncio.start_server(handle_schedule,'127.0.0.1',9120))
+ 
+    async def resend():
+        while True:
+            if Send_Queue.empty():
+                await asyncio.sleep(0.2)
+                continue
+            while not Send_Queue.empty():
+                reader,writer = reader,writer =await asyncio.open_connection('127.0.0.1',8888)
+                message=Send_Queue.get()
+                writer.write(bytes('{}'.format(message),encoding='utf-8'))
+                await writer.drain()
+            writer.close()
+    loop.create_task(resend())
+
+    loop.run_forever()
 
     #addr = server.sockets[0].getsockname()
     #print(f'Serving on {addr}')
@@ -91,6 +97,7 @@ class FileSystem(object):
             return False
         elif operation=='clear':
             print('\n'*20)
+            return True
         elif operation=='help':
             print("[mkdir]:Create a new directory\n[ls]:List all the file\n[more]:Check the details\n[vi]:Create a new file")
             print("[cd]:Go to a diretory\n[rm]:Delete a file or directory\n[find]:Search the subfile in the current directory")
@@ -128,11 +135,27 @@ class FileSystem(object):
         
     def start(self):
         #异步网络接收通讯
-        self.network_thread = threading.Thread(target=self.keep_network_open,args=(asyncio.get_event_loop(),))
+        self.network_thread = threading.Thread(target=maintain_client)
         self.network_thread.start()
+        #后台任务执行线程
+        self.backend_thread = threading.Thread(target=self.keep_answering)
+        self.backend_thread.start()
         #同步网络接收输入
         self.recv_input()
-
+    
+    def keep_answering(self):
+        while True:
+            if Recv_Queue.empty():
+                time.sleep(0.5)
+                continue
+            while not Recv_Queue.empty():
+                command=Recv_Queue.get()
+                if command['Type'] == 'Save':
+                    content,block_index=command['Content'],command['Block']
+                    self.handle_vi(content,block_index)
+                elif command['Type'] == 'Load':
+                    position,block_index=command['Position'],command['Block']
+                    self.handle_more(position,block_index)
 
     
     def answer(self):
@@ -155,7 +178,6 @@ class FileSystem(object):
             self.find()
             print("search result:\n",self.result)
 
-
     def roll_back(self):
         anchor=2
         while self.current_path[-anchor]!='\\':
@@ -163,8 +185,6 @@ class FileSystem(object):
             anchor=anchor+1
         self.current_path=self.current_path[:-anchor+1]
         print(self.current_path)
-
-
 
     def mkdir(self):
         location_index=self.user_manager.get_current_dir_index()
@@ -210,6 +230,9 @@ class FileSystem(object):
 
         self.result=result
 
+    def handle_vi(self,content,block_index):
+        self.file_manager.block_manager.handle_save(content,block_index)
+
     def vi(self):
         file_name=self.parameter[0]
         try:
@@ -226,6 +249,15 @@ class FileSystem(object):
         loc_index=self.user_manager.get_current_dir_index()
         self.file_manager.update_dir_file(loc_index, {file_name: index})
         self.result="Create successfully"
+
+    def handle_more(self,position,block_index):
+        data=self.file_manager.block_manager.read_data(block_index)
+        command={
+            'Type':'Display',
+            'Content':transform(data,to_type='text'),
+            'Position':position
+        }
+        Send_Queue.put(command)
 
     def more(self):
         location_index=self.user_manager.get_current_dir_index()
@@ -336,8 +368,6 @@ class FileManager(object):
         pass
 
     def save(self,data,sign):
-        #print("Data",data)
-        #print("is saving...")
         data=transform(data)
         #记录字节流的长度
         size=len(data)
@@ -445,7 +475,6 @@ class NodeManager():
         return indexs
 
 
-
 class BlockManager():
     def __init__(self,bit,size,num):
         self.block_size=size
@@ -455,6 +484,10 @@ class BlockManager():
         # print("Block Manager initialized")
         pass
 
+    def handle_save(self,content,block_index):
+        #content = transform(content)
+        self.write_data(content,block_index)
+    
     def save(self,data):
         # print("type of data ",type(data))
         size=len(data)
@@ -492,22 +525,24 @@ class BlockManager():
             self.blocks[indexs[i]]=content[i*self.block_size:(i+1)*self.block_size]
 
     def write_data(self,data,indexs):
-        for i in range(len(indexs)):
-            self.blocks[indexs[i]]=data[i*self.block_size:(i+1)*self.block_size]
+        if type(indexs)==list:
+            for i in range(len(indexs)):
+                self.blocks[indexs[i]]=data[i*self.block_size:(i+1)*self.block_size]
+        else:
+            self.blocks[indexs] = data
+        print('Check distributed write:',indexs,data)
 
     def read_data(self,indexs):
         file_data=[]
-        assert(type(indexs)==list)
-
-        #逐块加载block内容
-        for index in indexs:
-            file_data.append(self.blocks[index])
-
-        #读取内容放入一整块
         byte_data=b''
-        for file_data_block in file_data:
-            byte_data=byte_data+file_data_block
-
+        if type(indexs)==list:
+            #逐块加载block内容
+            for index in indexs:
+                file_data.append(self.blocks[index])
+            for file_data_block in file_data:
+                byte_data=byte_data+file_data_block
+        elif type(indexs)==int:
+            byte_data = byte_data + self.blocks[indexs]
         return byte_data
 
 

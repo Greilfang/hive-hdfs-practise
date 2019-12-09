@@ -5,13 +5,7 @@ import threading
 import asyncio
 import functools
 import queue
-
-Orders = {
-    'mkdir':'mkdir notification',
-    'ls':'ls notification',
-    'vi':'vi notification',
-    'rm':'rm notification'
-}
+import time
 
 cluster_config={
     'NameNode':{
@@ -31,29 +25,32 @@ cluster_config={
 Send_Queue = queue.Queue(maxsize = 100)
 # 接收消息队列
 Recv_Queue = queue.Queue(maxsize = 100)
-async def maintain_server():
-    tasks=[]
-    async def handle_echo(reader,writer):
+def maintain_server():
+    loop=asyncio.new_event_loop()
+    async def handle_echo_resend(reader,writer):
         #print('handle_echo')
-        data = await reader.read(100)
-        heart_jump=data.decode()
-        addr = writer.get_extra_info('peername')
-        #print(f"Received {heart_jump!r} from {addr!r}")
-        #print(f"Send: {heart_jump!r}")
-        writer.write(data)
-        await writer.drain()
+        data = await reader.read(1000)
+        message=data.decode()
+        print('message:',message)
+        #判断是命令还是心跳包
+        if message != 'heart_jump':
+            print('get vi content')
+            message=eval(message)
+            print(message)
+            Recv_Queue.put(message)
+        elif type(message) == str:
+            addr = writer.get_extra_info('peername')
+            print(f"Received {message!r} from {addr!r},send back")
+            writer.write(data)
+            await writer.drain()
 
-    task_1=asyncio.create_task(asyncio.start_server(handle_echo,'127.0.0.1',8888))
-    tasks.append(task_1)
+    loop.create_task(asyncio.start_server(handle_echo_resend,'127.0.0.1',8888))
     
     async def schedule():
-        async def interval_send(time):
-            await asyncio.sleep(time)
-        def send_heart_jump(future,reader,writer,message):
-            print('send:',message)
-            writer.write(message.encode())
         while True:
-            await asyncio.sleep(0.5)
+            if Send_Queue.empty():
+                await asyncio.sleep(0.2)
+                continue
             try:
                 reader,writer =await asyncio.open_connection('127.0.0.1',9120)
             except Exception:
@@ -62,14 +59,10 @@ async def maintain_server():
                 message = Send_Queue.get()
                 writer.write(bytes('{}'.format(message),encoding='utf-8'))
                 await writer.drain()
-                #data=await reader.read(100)
-                #print('Received:',data)
 
-    
-    task_2=asyncio.create_task(schedule())
-    tasks.append(task_2)
+    loop.create_task(schedule())
 
-    await asyncio.gather(*tasks)
+    loop.run_forever()
 
 
 class FileSystem(object):
@@ -109,6 +102,7 @@ class FileSystem(object):
             return False
         elif operation=='clear':
             print('\n'*20)
+            return True
         elif operation=='help':
             print("[mkdir]:Create a new directory\n[ls]:List all the file\n[more]:Check the details\n[vi]:Create a new file")
             print("[cd]:Go to a diretory\n[rm]:Delete a file or directory\n[find]:Search the subfile in the current directory")
@@ -154,12 +148,29 @@ class FileSystem(object):
         
     def start(self):
         #异步网络接收通讯
-        self.network_thread = threading.Thread(target=self.keep_network_open,args=(asyncio.get_event_loop(),))
+        self.network_thread = threading.Thread(target=maintain_server)
         self.network_thread.start()
+        #后台程序执行进程
+        self.backend_thread=threading.Thread(target=self.keep_answering)
+        self.backend_thread.start()
         #同步网络接收输入
         self.recv_input()
 
-
+    def keep_answering(self):
+        while True:
+            if Recv_Queue.empty():
+                time.sleep(0.2)
+                continue
+            show_container=[]
+            self.result=''
+            while not Recv_Queue.empty():
+                command=Recv_Queue.get()
+                if command['Type']=='Display':
+                    show_container.append({'Content':command['Content'],'Position':command['Position']})
+            show_container=sorted(show_container,key=lambda x: x['Position'])
+            for sc in show_container:
+                self.result = self.result + sc['Content']
+            print(self.result)
     
     def answer(self):
         if self.operation=="mkdir":
@@ -185,7 +196,6 @@ class FileSystem(object):
     def roll_back(self):
         anchor=2
         while self.current_path[-anchor]!='\\':
-            #print("test:",self.current_path[-anchor])
             anchor=anchor+1
         self.current_path=self.current_path[:-anchor+1]
         print(self.current_path)
@@ -247,9 +257,10 @@ class FileSystem(object):
         except IndexError:
             self.result = 'Command error!'
             return
-        
+        content = transform(content)
         filesize = len(content)
         replic_nodes,replic_blocks=self.file_manager.schedule_save(filesize,sign='txt',replic=3)
+        print('replic_blocks:',replic_blocks)
         loc_index=self.user_manager.get_current_dir_index()
         self.file_manager.update_dir_file(loc_index, {file_name: replic_nodes})
 
@@ -264,23 +275,35 @@ class FileSystem(object):
                     'Type':'Save',
                     'Target':target_node,
                     'Content':content[bc*i:bc*(i+1)],
-                    'Node':client_block
+                    'Block':client_block
                 }
                 Send_Queue.put(command)
         self.result="Create successfully"
 
     def more(self):
         location_index=self.user_manager.get_current_dir_index()
+        # 取出目录
         dir_data=self.file_manager.load(location_index=location_index,data_type='dir')
+        print('dir_data:',dir_data)
         try:
             file_name=self.parameter[0]
-            index=dir_data[file_name]
+            indexs=dir_data[file_name]
+            print('file node indexs:',indexs)
         except KeyError:
             print("Can not find the file!")
             return
-
-        data=self.file_manager.load(location_index=index,data_type='text')
-        self.result=data
+        node_index=indexs[0]
+        block_indexs=self.file_manager.schedule_load(location_index=node_index)
+        for i,block_index in enumerate(block_indexs):
+            target_node,client_block=self.toClientBlockIndex(block_index)
+            command={
+                    'Type':'Load',
+                    'Target':target_node,
+                    'Position':i,
+                    'Block':client_block
+            }
+            print('command:',command)
+            Send_Queue.put(command)
 
     def cd(self):
         if self.parameter[0]=='.':
@@ -416,6 +439,11 @@ class FileManager(object):
         index=self.save(dir_data,'dir')
         return index
 
+    def schedule_load(self,location_index):
+        node = self.node_manager.get_node(location_index)
+        block_indexs=node.get_block_indexs()
+        return block_indexs
+
     def load(self,location_index,data_type):
         node=self.node_manager.get_node(location_index)
         block_indexs=node.get_block_indexs()
@@ -527,6 +555,8 @@ class BlockManager():
         return indexs
 
     def allocate_blocks(self,size):
+        print('filesize:',size)
+        print('self.block_size:',self.block_size)
         allocated_block_num=int(size/self.block_size)+1
         block_indexs=[]
         data_block_index=np.where(self.map==0)

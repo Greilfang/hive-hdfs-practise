@@ -12,20 +12,20 @@ now = lambda : time.time()
 cluster_config={
     'NameNode':{
         'addr':('127.0.0.1',8888),
-        'block_num':12000
+        'block_num':12000,
+        'last_echo':now()
         },
     'DataNode_1':{
         'addr':('127.0.0.1',9120),
         'block_num':12000,
         'status':'Alive',
-        'last_echo':now()-0
+        'last_echo':now()
         },
     'DataNode_2':{
         'addr':('127.0.0.1',10070),
         'block_num':12000,
-        'status':'Alive'
-        'last_echo':now()-0
-        
+        'status':'Alive',
+        'last_echo':now()
         }
 }
 # 发送消息队列
@@ -38,17 +38,22 @@ def maintain_server():
         #print('handle_echo')
         data = await reader.read(1000)
         message=data.decode()
-        #print('message:',message)
-        #判断是命令还是心跳包
-        if message != 'heart_jump':
-            #print('get vi content')
-            message=eval(message)
+        print('message:',message)
+        message = eval(message)
+        if message['Type'] == 'Display':
             print('resend_check:',message)
             Recv_Queue.put(message)
-        elif type(message) == str:
-            #addr = writer.get_extra_info('peername')
-            #print(f"Received {message!r} from {addr!r},send back")
-            pass
+        elif message['Type'] == 'heart_jump':
+            present_time=now()
+            cluster_config['NameNode']['last_echo']=present_time
+            name=message['Name']
+
+            cluster_config[name]['last_echo']=present_time
+            cluster_config[name]['status']='Alive'
+            for k,v in cluster_config.items():
+                if present_time - v['last_echo']>40:
+                    print(k,'is dead')
+                    v['status']='Dead'
 
     loop.create_task(asyncio.start_server(handle_echo_resend,*cluster_config['NameNode']['addr']))
     
@@ -582,6 +587,8 @@ class BlockManager():
             nodes=list(self.maps.keys())
             anchor = 0
             for i in range(allocated_block_num):
+                while cluster_config[nodes[anchor]]['status'] != 'Alive':
+                    anchor=(anchor+1)%len(nodes)
                 node_name = nodes[anchor]
                 if cluster_config[node_name]['status'] =='Alive':
                     data_block_index=np.where(self.maps[node_name]==0)

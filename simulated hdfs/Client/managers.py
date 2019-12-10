@@ -12,6 +12,7 @@ Send_Queue=queue.Queue(maxsize=100)
 # 接收消息队列
 Recv_Queue=queue.Queue(maxsize=100)
 cluster_config={
+    'Name':'DataNode_1',
     'NameNode':('127.0.0.1',8888),
     'SelfNode':('127.0.0.1',9120)
 }
@@ -20,14 +21,17 @@ def maintain_client():
     # 用于传递心跳包
     async def echo():
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(20)
             try:
                 reader,writer =await asyncio.open_connection(*cluster_config['NameNode'])
             except Exception:
                 continue
-            message='heart_jump'
-            #print('send',message)
-            writer.write(message.encode())
+            message={
+                'Type':'heart_jump',
+                'Name':cluster_config['Name']
+            }
+            print('send',message)
+            writer.write(bytes('{}'.format(message),encoding='utf-8'))
             await writer.drain()
             writer.close()
     loop.create_task(echo())

@@ -13,8 +13,7 @@ Send_Queue=queue.Queue(maxsize=100)
 Recv_Queue=queue.Queue(maxsize=100)
 cluster_config={
     'NameNode':('127.0.0.1',8888),
-    'DataNode_1':('127.0.0.1',9120),
-    'DataNode_2':('127.0.0.1',10070)
+    'SelfNode':('127.0.0.1',9120)
 }
 def maintain_client():
     loop=asyncio.new_event_loop()
@@ -23,15 +22,13 @@ def maintain_client():
         while True:
             await asyncio.sleep(60)
             try:
-                reader,writer =await asyncio.open_connection('127.0.0.1',8888)
+                reader,writer =await asyncio.open_connection(*cluster_config['NameNode'])
             except Exception:
                 continue
             message='heart_jump'
-            print('send',message)
+            #print('send',message)
             writer.write(message.encode())
             await writer.drain()
-            data = await reader.read(100)
-            print('Received:',data)
             writer.close()
     loop.create_task(echo())
 
@@ -43,7 +40,7 @@ def maintain_client():
         print('Received:',eval(command))
         Recv_Queue.put(eval(command))
         pass   
-    loop.create_task(asyncio.start_server(handle_schedule,'127.0.0.1',9120))
+    loop.create_task(asyncio.start_server(handle_schedule,*cluster_config['SelfNode']))
  
     async def resend():
         while True:
@@ -51,17 +48,19 @@ def maintain_client():
                 await asyncio.sleep(0.2)
                 continue
             while not Send_Queue.empty():
-                reader,writer = reader,writer =await asyncio.open_connection('127.0.0.1',8888)
+                reader,writer = reader,writer =await asyncio.open_connection(*cluster_config['NameNode'])
                 message=Send_Queue.get()
-                writer.write(bytes('{}'.format(message),encoding='utf-8'))
+                print('resend:',message)
+                try:
+                    writer.write(bytes('{}'.format(message),encoding='utf-8'))
+                except Exception:
+                    print('write fail')
                 await writer.drain()
-            writer.close()
+                writer.close()
     loop.create_task(resend())
 
     loop.run_forever()
 
-    #addr = server.sockets[0].getsockname()
-    #print(f'Serving on {addr}')
 
 
 class FileSystem(object):
@@ -82,9 +81,7 @@ class FileSystem(object):
         self.network_thread = None
 
         print('*************************************************************')
-        print('******             Welcome to the GreilFS!             ******')
-        print('******       A Simulated Distributed File System       ******')
-        print('******               Designed by Fangpei.              ******')
+        print('******            This is GreilFS DataNode             ******')
         print('******                      V1.0                       ******')
         print('*************************************************************')
 
@@ -154,8 +151,8 @@ class FileSystem(object):
                     content,block_index=command['Content'],command['Block']
                     self.handle_vi(content,block_index)
                 elif command['Type'] == 'Load':
-                    position,block_index=command['Position'],command['Block']
-                    self.handle_more(position,block_index)
+                    position,block_index,max_pos=command['Position'],command['Block'],command['Max_Pos']
+                    self.handle_more(position,block_index,max_pos)
 
     
     def answer(self):
@@ -181,7 +178,6 @@ class FileSystem(object):
     def roll_back(self):
         anchor=2
         while self.current_path[-anchor]!='\\':
-            #print("test:",self.current_path[-anchor])
             anchor=anchor+1
         self.current_path=self.current_path[:-anchor+1]
         print(self.current_path)
@@ -215,9 +211,6 @@ class FileSystem(object):
         location_index=self.user_manager.get_current_dir_index()
         dir_data=self.file_manager.load(location_index,'dir')
 
-        #print("type",type(dir_data))
-        #print("ls_dir_data",dir_data)
-
         dir_data.pop('.')
         dir_data.pop('..')
 
@@ -250,12 +243,13 @@ class FileSystem(object):
         self.file_manager.update_dir_file(loc_index, {file_name: index})
         self.result="Create successfully"
 
-    def handle_more(self,position,block_index):
+    def handle_more(self,position,block_index,max_pos):
         data=self.file_manager.block_manager.read_data(block_index)
         command={
             'Type':'Display',
             'Content':transform(data,to_type='text'),
-            'Position':position
+            'Position':position,
+            'Max_Pos':max_pos
         }
         Send_Queue.put(command)
 

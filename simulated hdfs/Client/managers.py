@@ -157,6 +157,10 @@ class FileSystem(object):
                 elif command['Type'] == 'Load':
                     position,block_index,max_pos=command['Position'],command['Block'],command['Max_Pos']
                     self.handle_more(position,block_index,max_pos)
+                elif command['Type'] == 'Rebuild':
+                    # 获得要返回的block_index
+                    reget_block,resave_block,repost_addr=command['Reget_Block'],command['Resave_Block'],command['Repost']
+                    self.handle_rebuild(reget_block,resave_block,repost_addr)
 
     
     def answer(self):
@@ -248,12 +252,24 @@ class FileSystem(object):
         self.result="Create successfully"
 
     def handle_more(self,position,block_index,max_pos):
-        data=self.file_manager.block_manager.read_data(block_index)
+        data = self.file_manager.block_manager.read_data(block_index)
+        print('data:',data)
         command={
             'Type':'Display',
             'Content':transform(data,to_type='text'),
             'Position':position,
             'Max_Pos':max_pos
+        }
+        Send_Queue.put(command)
+
+    def handle_rebuild(self,reget_block,resave_block,repost_addr):
+        data = self.file_manager.block_manager.read_data(reget_block)
+        # 取出要获得的数据
+        command={
+            'Type':'Rebuild',
+            'Content':transform(data,to_type='text'),
+            'Block':reget_block,
+            'Repost':repost_addr
         }
         Send_Queue.put(command)
 
@@ -540,6 +556,7 @@ class BlockManager():
             for file_data_block in file_data:
                 byte_data=byte_data+file_data_block
         elif type(indexs)==int:
+            print('read_data_blocks:',self.blocks[indexs])
             byte_data = byte_data + self.blocks[indexs]
         return byte_data
 

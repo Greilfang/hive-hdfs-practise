@@ -52,9 +52,7 @@ class Node(object):
         return{"size":self.file_size,"block_num":self.block_num}
 
     def get_block_indexs(self):
-        index_dict=self.block_index
         block_indexs=[]
-
         count = 0
         for i in range(self.block_num):
             count = count+1
@@ -64,6 +62,8 @@ class Node(object):
                 block_indexs.append(self.block_index[13][count-12])
 
         return block_indexs
+    def directly_get_block_indexs(self):
+        return self.block_index
 
 class User(object):
     def __init__(self):

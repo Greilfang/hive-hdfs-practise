@@ -6,13 +6,14 @@ import asyncio
 import functools
 import queue
 import time
-
+import copy
 now = lambda : time.time()
 
 cluster_config={
     'NameNode':{
         'addr':('127.0.0.1',8888),
         'block_num':12000,
+        'status':'Alive',
         'last_echo':now()
         },
     'DataNode_1':{
@@ -35,13 +36,10 @@ Recv_Queue = queue.Queue(maxsize = 100)
 def maintain_server():
     loop=asyncio.new_event_loop()
     async def handle_echo_resend(reader,writer):
-        #print('handle_echo')
         data = await reader.read(1000)
         message=data.decode()
-        print('message:',message)
         message = eval(message)
         if message['Type'] == 'Display':
-            print('resend_check:',message)
             Recv_Queue.put(message)
         elif message['Type'] == 'heart_jump':
             present_time=now()
@@ -51,9 +49,20 @@ def maintain_server():
             cluster_config[name]['last_echo']=present_time
             cluster_config[name]['status']='Alive'
             for k,v in cluster_config.items():
-                if present_time - v['last_echo']>40:
+                #跳过cluster_config里挂掉的的DataNode
+                if v['status']=='Dead':continue
+                if present_time - v['last_echo']>25:
                     print(k,'is dead')
                     v['status']='Dead'
+                    #发送目标及其失效的消息
+                    message={
+                        'Type':'Replic',
+                        'Target':k
+                    }
+                    Recv_Queue.put(message)
+        # 传回Content以后的操作
+        elif message['Type']=='Rebuild':
+            Recv_Queue.put(message)
 
     loop.create_task(asyncio.start_server(handle_echo_resend,*cluster_config['NameNode']['addr']))
     
@@ -68,7 +77,6 @@ def maintain_server():
                     reader,writer = await asyncio.open_connection(*(message['Target']))
                 except Exception:
                     print('Address Error')
-                print('target:',message['Target'])
                 writer.write(bytes('{}'.format(message),encoding='utf-8'))
                 await writer.drain()
                 
@@ -93,7 +101,6 @@ class FileSystem(object):
         }
         self.result=""
         self.current_path="root\\"
-        
         # 通讯线程
         self.network_thread = None
 
@@ -112,14 +119,14 @@ class FileSystem(object):
         if operation =='exit':
             return False
         elif operation=='clear':
-            print('\n'*20)
+            print('\n'*30)
             return True
         elif operation=='help':
             print("[mkdir]:Create a new directory\n[ls]:List all the file\n[more]:Check the details\n[vi]:Create a new file")
-            print("[cd]:Go to a diretory\n[rm]:Delete a file or directory\n[find]:Search the subfile in the current directory")
+            print("[cd]:Go to a diretory")
             print("[exit]:Exit and save")
             return True
-        elif operation in("mkdir","ls","vi","more","cd",'rm','find'):
+        elif operation in("mkdir","ls","vi","more","cd",'rm'):
             if len(boxes)==3:
                 self.operation=boxes[0]
                 self.parameter[0]=boxes[1]
@@ -178,6 +185,22 @@ class FileSystem(object):
                     print(self.result)
                     show_container=[]
                     max_len=0
+            elif command['Type']=='Replic':
+                target_name=command['Target']
+                # 开始重建复制集
+                self.rebuild_replication(target_name)
+            elif command['Type']=='Rebuild':
+                target,content,block=command['Repost'],command['Content'],command['Block']
+                #print('reget content')
+                #print(content)
+                command={
+                    'Type':'Save',
+                    'Target':target,
+                    'Content':transform(content),
+                    'Block':block
+                }
+                Send_Queue.put(command)
+
 
     
     def answer(self):
@@ -192,11 +215,56 @@ class FileSystem(object):
             self.more()
         elif self.operation=="cd":
             self.cd()
-        elif self.operation=="rm":
-            self.rm()
-        elif self.operation=="find":
-            self.find()
-            print("search result:\n",self.result)
+    
+    def rebuild_replication(self,target):
+        '''
+        resilances[{node_1:[...],node_2:[...]},{}]
+        '''
+        resilances = self.file_manager.block_manager.resilance_map
+        nodes=list(self.file_manager.block_manager.maps.keys())
+        for resilance in resilances:
+            if target in resilance and len(resilance.keys())>2:
+                anchor=0
+                replaced_blocks=[[],[]]
+                # 删除block和该节点的依赖关系
+                temporary_store=copy.deepcopy(resilance[target])
+                del resilance[target]
+                print('temp:',temporary_store)
+                for replaced_index in temporary_store:
+                    replaced_blocks[0].append({'name':target,'clean':replaced_index})
+                    #分配一个新的存活datanode和其block
+                    while not cluster_config[nodes[anchor]]['status'] =='Alive':
+                        anchor=(anchor+1)%len(nodes)
+                    belonger,block_index=self.file_manager.block_manager.allocate_blocks(size=0,to_type='file',anchor=anchor)[0].values()
+                    print('belonger:',belonger,block_index)
+                    replaced_blocks[1].append({'name':belonger,'clean':block_index})
+                    #得到要获得拷贝数据的节点
+                    k = list(resilance.keys())[-1]
+                    if belonger in resilance:
+                        resilance[belonger].append(block_index)
+                    else:
+                        resilance[belonger]=block_index
+                    command={
+                        'Type':'Rebuild',
+                        'Target':cluster_config[k]['addr'],
+                        'Reget_Block':resilance[k][0],
+                        'Resave_Block':block_index,
+                        'Repost':cluster_config[belonger]['addr']
+                    }
+                    Send_Queue.put(command)
+                #发出命令之后更新nodes
+                for node_index in resilance['node']:
+                    block_indexs = self.file_manager.node_manager.get_block_indexs(node_index)
+                    print(block_indexs)
+                    context_part_num = len(block_indexs)
+                    for i in range(context_part_num):
+                        if block_indexs[i] in replaced_blocks[0]:
+                            index=replaced_blocks[0].index(block_indexs[i])
+                            block_indexs[i]=replaced_blocks[1][index]
+                            #print('replaced:',replaced_blocks[1][index])
+                    #print('after changed:')
+                    #print(block_indexs)
+                    self.file_manager.node_manager.reset_block_indexs(node_index,block_indexs)
 
 
     def roll_back(self):
@@ -223,7 +291,6 @@ class FileSystem(object):
         }
 
         index=self.file_manager.save(data=data,sign="dir")
-        print('index:',index)
         #print("New directory file name: ",name," node index: ",index)
         #更新目录信息
         #print("Current Dir node index ", location_index)
@@ -236,9 +303,6 @@ class FileSystem(object):
     def ls(self):
         location_index=self.user_manager.get_current_dir_index()
         dir_data=self.file_manager.load(location_index,'dir')
-
-        #print("type",type(dir_data))
-        #print("ls_dir_data",dir_data)
 
         dir_data.pop('.')
         dir_data.pop('..')
@@ -265,43 +329,50 @@ class FileSystem(object):
         # 将写入内容转化成bit流
         content = transform(content)
         filesize = len(content)
+        # replic_nodes 表示 每一个副本的block信息被存放在哪一个node里
         replic_nodes,replic_blocks=self.file_manager.schedule_save(filesize,sign='txt',replic=3)
-        print('replic_blocks:',replic_blocks)
+        #print('replic_blocks:',replic_blocks)
         loc_index=self.user_manager.get_current_dir_index()
         self.file_manager.update_dir_file(loc_index, {file_name: replic_nodes})
 
-        for blocks in replic_blocks:
-            for i,block in enumerate(blocks):
-                bc=self.file_manager.block_manager.block_size
-                #分割出DataNode要保存的内容
-                print('block:')
-                print(block)
-                node_name,client_block_index=block['name'],block['clean']
+        bc=self.file_manager.block_manager.block_size
+        content_part_num=len(replic_blocks[0])
+
+        for i in range(content_part_num):
+            #为每一个数据块所有的副本建立一个共同的副本
+            resilance={'node':replic_nodes}
+            for blocks in replic_blocks:
+                #print('block:',blocks[i])
+                node_name,client_block_index=blocks[i]['name'],blocks[i]['clean']
                 command={
                     'Type':'Save',
                     'Target':self.cluster_config[node_name]['addr'],
                     'Content':content[bc*i:bc*(i+1)],
                     'Block':client_block_index
                 }
+                if node_name in resilance:
+                    resilance[node_name].append(client_block_index)
+                else:
+                    resilance[node_name]=[client_block_index]
                 Send_Queue.put(command)
-        self.result="Create successfully"
+            self.file_manager.block_manager.resilance_map.append(resilance)
+        self.result='Save Successfully'
 
     def more(self):
         location_index=self.user_manager.get_current_dir_index()
         # 取出目录
         dir_data=self.file_manager.load(location_index=location_index,data_type='dir')
-        print('dir_data:',dir_data)
+        #print('dir_data:',dir_data)
         try:
             file_name=self.parameter[0]
             indexs=dir_data[file_name]
-            print('file node indexs:',indexs)
         except KeyError:
-            print("Can not find the file!")
+            print("No such file")
             return
         # 选出一个 node 
         node_index=indexs[0]
         block_indexs=self.file_manager.schedule_load(location_index=node_index)
-        print('more block indexs')
+        #print('more block indexs')
         for i,block_index in enumerate(block_indexs):
             node_name=block_index['name']
             command={
@@ -311,7 +382,7 @@ class FileSystem(object):
                     'Max_Pos':len(block_indexs),
                     'Block':block_index['clean']
             }
-            print('command:',command)
+            #print('command:',command)
             Send_Queue.put(command)
 
     def cd(self):
@@ -339,7 +410,6 @@ class FileSystem(object):
     def rm(self):
         location_index = self.user_manager.get_current_dir_index()
         dir_data=self.file_manager.load(location_index,'dir')
-        #找到这一项
         try:
             target=self.parameter[0]
             target_index = dir_data[target]
@@ -400,6 +470,7 @@ class FileManager(object):
         self.block_manager=BlockManager(
             super_block.bit,super_block.data_block_size,super_block.data_block_num,cluster_config)
 
+
         root_dir={
             '.':'root',
             '..':0
@@ -411,12 +482,16 @@ class FileManager(object):
 
     def schedule_save(self,filesize,sign,replic=1):
         replic_node_indexes,replic_block_indexes=[],[]
+        nodes=list(self.block_manager.maps.keys())
+        anchor=0
         for r in range(replic):
-            # 应该把block_index改成一个字典
-            block_index=self.block_manager.schedule_save(filesize)
+            while cluster_config[nodes[anchor]]['status'] != 'Alive':
+                anchor=(anchor+1)%len(nodes)
+            block_index=self.block_manager.schedule_save(filesize,anchor)
             replic_block_indexes.append(block_index)
             node_index=self.node_manager.schedule_save(block_index,filesize,sign)
             replic_node_indexes.append(node_index)
+            anchor=(anchor+1)%len(nodes)
         return replic_node_indexes,replic_block_indexes
 
     def save(self,data,sign):
@@ -530,6 +605,11 @@ class NodeManager():
         one_node_index=xy_to_index(self.map.shape[1],node_index_x,node_index_y)
         #返回分配的i-node节点索引
         return one_node_index
+    
+    def reset_block_indexs(self,node_index,block_index):
+        node=self.get_node(node_index)
+        node.set_block_indexs(block_index)
+
 
     #擦除某一节点
     def wipe(self,index):
@@ -541,12 +621,16 @@ class NodeManager():
 
 
 
-    #返回指定下标的索引节点
+    #返回指定索引下标的索引节点
     def get_node(self,index):
         return self.nodes[index]
 
     def get_block_indexs(self,index):
         indexs=self.nodes[index].get_block_indexs()
+        return indexs
+    
+    def directly_get_block_indexs(self,index):
+        indexs=self.nodes[index].directly_get_block_indexs()
         return indexs
 
 
@@ -561,9 +645,11 @@ class BlockManager():
             if k =='NameNode':continue
             self.maps[k]=np.zeros((bit,int(v['block_num']/bit)))
         self.name=list(config.keys())[0]
+        # 保存每个数据块及其副本的依赖关系
+        self.resilance_map=[]
     
-    def schedule_save(self,filesize):
-        indexs=self.allocate_blocks(filesize,to_type='file')
+    def schedule_save(self,filesize,anchor):
+        indexs=self.allocate_blocks(filesize,to_type='file',anchor=anchor)
         return indexs
     def save(self,data):
         # print("type of data ",type(data))
@@ -577,19 +663,15 @@ class BlockManager():
         self.write_data(data,block_index)
         return indexs
 
-    def allocate_blocks(self,size,to_type):
+    def allocate_blocks(self,size,to_type,anchor=0):
         # 计算出总计要分配的block个数
         allocated_block_num=int(size/self.block_size)+1
-        print('allocated_block_num:',allocated_block_num)
+        #print('allocated_block_num:',allocated_block_num)
         block_indexs=[]
-        #如果保存的是命名空间就从0开始
         if to_type =='file':
             nodes=list(self.maps.keys())
-            anchor = 0
+            node_name = nodes[anchor]
             for i in range(allocated_block_num):
-                while cluster_config[nodes[anchor]]['status'] != 'Alive':
-                    anchor=(anchor+1)%len(nodes)
-                node_name = nodes[anchor]
                 if cluster_config[node_name]['status'] =='Alive':
                     data_block_index=np.where(self.maps[node_name]==0)
                     block_index_x=data_block_index[0][i]
